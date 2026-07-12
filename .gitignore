@@ -1,0 +1,23 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Data / indexes / model artifacts (large, regenerable)
+data/
+indexes/
+*.faiss
+*.bin
+*.jsonl.gz
+
