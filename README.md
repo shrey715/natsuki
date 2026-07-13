@@ -78,9 +78,42 @@ full 1M-doc embed job at roughly two days of wall-clock time, so a larger
 run needs either a faster model, batching optimization, or to be treated
 as a genuine overnight/multi-day batch job rather than an interactive step).
 
+**Phase 4 (done):** LLM query expansion via the Mistral API.
+
+- `src/natsuki/llm.py` — thin wrapper around `mistralai`'s chat API.
+  Note: this SDK build (2.6.0) ships with no root-level
+  `mistralai/__init__.py`; the working import is
+  `from mistralai.client import Mistral`, not the documented
+  `from mistralai import Mistral`.
+- `src/natsuki/query_understanding.py` — `expand_query()` appends
+  Mistral-generated related terms/synonyms to a query before retrieval,
+  falling back to the original query unchanged on any API failure.
+- `src/natsuki/cli.py` — `evaluate --expand-query`, `evaluate --limit N`
+  (query expansion adds a network round-trip per query, so `--limit` keeps
+  experiments against a paid API cheap/fast).
+
+**A/B result on 100 held-out test queries** (rerank mode, same subset with
+and without expansion):
+
+| variant         | ndcg@10 | mrr    | recall@10 | ms/query |
+|-----------------|---------|--------|-----------|----------|
+| rerank          | 0.7855  | 0.7570 | 0.9097    | 67.89    |
+| rerank + expand | 0.7708  | 0.7321 | 0.9197    | 453.63   |
+
+Query expansion **hurt** top-of-ranking precision (NDCG@10, MRR both
+dropped) while modestly improving recall@10, and added ~400ms/query of
+pure network latency. Read honestly rather than as a failure to hide: on
+SciFact, queries are precise scientific claims, and BM25/dense retrieval
+are already strong on this vocabulary; injected synonyms likely add
+lexical noise that dilutes specificity more than it closes a
+vocabulary-mismatch gap. This is the expected outcome on a task where the
+base retrievers are already well-matched to the corpus's language — the
+technique is still worth having (a different, jargon-mismatched corpus is
+where it should help), but it isn't a blind win, and the eval caught that
+instead of a hand-picked example papering over it.
+
 **Not yet built:**
 
-- Query understanding / LLM-judge eval via Mistral API.
 - Real-time incremental indexing.
 - Permission-aware filtering (deliberately descoped for now).
 
@@ -101,10 +134,9 @@ uv sync
 cp .env.example .env   # then fill in MISTRAL_API_KEY
 ```
 
-`.env` is gitignored — never commit it. `MISTRAL_API_KEY` isn't used yet
-(Phase 1 is pure classical IR, no LLM calls); it's wired into
-`src/natsuki/config.py` ready for Phase 2 (dense embeddings / reranking /
-query understanding).
+`.env` is gitignored — never commit it. `MISTRAL_API_KEY` is required for
+`evaluate --expand-query` (see Phase 4 below); every other command works
+without it.
 
 ## Usage
 
@@ -131,6 +163,11 @@ uv run natsuki evaluate --dataset beir/scifact/test --mode rerank \
   --index indexes/scifact.index.gz --dense-index indexes/scifact.dense.npz \
   --reranker models/reranker.txt --k 10
 
+# Same, with LLM query expansion (Mistral API), capped to 100 queries
+uv run natsuki evaluate --dataset beir/scifact/test --mode rerank \
+  --index indexes/scifact.index.gz --dense-index indexes/scifact.dense.npz \
+  --reranker models/reranker.txt --k 10 --expand-query --limit 100
+
 # Ad-hoc single BM25 query
 uv run natsuki search --index indexes/scifact.index.gz --query "your query here" --k 10
 ```
@@ -141,15 +178,18 @@ uv run natsuki search --index indexes/scifact.index.gz --query "your query here"
 uv run pytest -q
 ```
 
-30 unit tests covering tokenizer edge cases, BM25 ranking behavior (term
+35 unit tests covering tokenizer edge cases, BM25 ranking behavior (term
 frequency ordering, no-match handling, unfinalized-index guard), dense
 index search/persistence, reciprocal rank fusion, candidate feature
 extraction, the LambdaMART reranker (including a synthetic-data test that
-checks it actually learns to weight a real signal over pure noise), and
-eval metrics against hand-computed NDCG/MRR/Recall values. Dense-index and
-reranker tests use hand-crafted vectors/features rather than the real
-embedding model, so the suite stays fast and offline — embedding
-correctness itself was checked manually (see `natsuki/embeddings.py`
+checks it actually learns to weight a real signal over pure noise), query
+expansion (via an injected fake chat function, including its
+fail-open-to-original-query behavior), and eval metrics against
+hand-computed NDCG/MRR/Recall values. Dense-index, reranker, and query-
+expansion tests use hand-crafted vectors/features or fake LLM responses
+rather than the real embedding/chat models, so the suite stays fast,
+free, and offline — embedding correctness itself was checked manually
+(see `natsuki/embeddings.py`
 docstring) and validated indirectly by the SciFact NDCG numbers above
 matching the published baseline.
 
