@@ -74,7 +74,37 @@ matter, rather than either of these.
 
 ## Generalization beyond SciFact
 
-<!-- TODO: results for NFCorpus and ArguAna go here -->
+Same pipeline, no per-dataset tuning, run against two more BEIR datasets
+chosen for being a different shape of problem: **NFCorpus** (3,633 docs,
+medical/nutrition question answering) and **ArguAna** (8,674 docs,
+counter-argument retrieval, where the "query" is itself a full paragraph
+argument rather than a short query).
+
+| dataset  | bm25 ndcg@10 | dense ndcg@10 | hybrid ndcg@10 |
+|----------|--------------|---------------|----------------|
+| scifact  | 0.6692       | 0.7215        | 0.7245         |
+| nfcorpus | 0.3122       | 0.3432        | 0.3574         |
+| arguana  | 0.3273       | 0.4278        | 0.4089         |
+
+NFCorpus's BM25 number (0.3122) lands close to the published BEIR
+baseline (~0.32), the same kind of correctness check as SciFact's.
+
+The interesting part is how differently the three datasets behave.
+Dense retrieval's advantage over BM25 is huge on SciFact, small on
+NFCorpus, and huge again on ArguAna — task-dependent, not a fixed
+property of dense-vs-lexical search. More notably: **hybrid RRF fusion
+helps on SciFact and NFCorpus but actively hurts on ArguAna**
+(0.4089 vs. dense-only's 0.4278). RRF's fixed `1/(k+rank)` formula
+combines whatever two rankings it's given with no notion of which one is
+more trustworthy for this task; on ArguAna, BM25's lexical overlap
+signal is apparently misleading enough (matching topically similar but
+not actually counter-arguing passages) that folding it in drags down an
+already-strong dense ranking. This is exactly the failure mode a learned
+combiner (like the Phase 3 reranker) should handle better than a fixed
+formula, since it could in principle learn to downweight BM25 per
+dataset instead of always trusting it equally — untested here since a
+reranker was only trained for SciFact, but it's the natural next
+experiment if this generalization work continues.
 
 ## Evidence extraction
 
