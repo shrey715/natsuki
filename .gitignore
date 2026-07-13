@@ -17,6 +17,7 @@ wheels/
 # Data / indexes / model artifacts (large, regenerable)
 data/
 indexes/
+models/
 *.faiss
 *.bin
 *.jsonl.gz
