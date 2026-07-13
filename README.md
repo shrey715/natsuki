@@ -72,6 +72,40 @@ why production systems reach for graph-based structures (HNSW) or
 vectorized libraries (FAISS) once the corpus is big enough for it to
 matter, rather than either of these.
 
+## Generalization beyond SciFact
+
+<!-- TODO: results for NFCorpus and ArguAna go here -->
+
+## Evidence extraction
+
+Retrieval returns whole documents. `natsuki explain` goes one step
+further: it retrieves the top-k documents for a query, then splits each
+into sentences and returns the one(s) most relevant to the query by
+embedding similarity, instead of the full document text
+(`src/natsuki/evidence.py`). Example, on SciFact:
+
+```text
+$ natsuki explain --dataset beir/scifact/test --dense-index indexes/scifact.dense.npz \
+    --index indexes/scifact.index.gz --query "0-dimensional biomaterials show inductive properties." --k 3
+
+1. 43385013
+   [0.703] We used nontumorigenic basal cell lines as models of normal stem
+   cells/progenitors and demonstrate that these cell lines contain an
+   epithelial subpopulation ...
+2. 40212412
+   [0.736] This need is met by the lever function of long bones,
+   three-dimensional masterpieces of biomechanical engineering ...
+```
+
+This is a heuristic, not a benchmarked system: BEIR's version of SciFact
+strips the original dataset's sentence-level evidence annotations (each
+claim's real SUPPORT/CONTRADICT rationale sentences), so there's no
+ground truth here to measure extraction accuracy against — the sentence
+ranking is just cosine similarity between the query and each sentence,
+using the same embedding model as dense retrieval. The sentence splitter
+is a plain regex, not a real tokenizer, so it will mishandle common
+scientific-text abbreviations ("Fig. 1", "e.g.").
+
 ## Architecture
 
 ```text
