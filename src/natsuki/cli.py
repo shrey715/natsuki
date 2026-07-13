@@ -105,6 +105,8 @@ def _cmd_evaluate(args: argparse.Namespace) -> None:
 
     queries = load_queries(args.dataset)
     qrels = load_qrels(args.dataset)
+    if args.limit:
+        queries = dict(list(queries.items())[: args.limit])
 
     bm25 = None
     dense = None
@@ -128,6 +130,11 @@ def _cmd_evaluate(args: argparse.Namespace) -> None:
     results: dict[str, list[str]] = {}
     t0 = time.time()
     for qid, qtext in tqdm(queries.items(), desc="querying", unit="query"):
+        if args.expand_query:
+            from natsuki.query_understanding import expand_query
+
+            qtext = expand_query(qtext)
+
         if args.mode == "bm25":
             hits = bm25.search(qtext, top_k=fanout)
             results[qid] = [doc_id for doc_id, _ in hits]
@@ -208,6 +215,12 @@ def main() -> None:
     )
     p_eval.add_argument("--reranker", help="Trained reranker model path (required for mode=rerank)")
     p_eval.add_argument("--k", type=int, default=10)
+    p_eval.add_argument(
+        "--expand-query",
+        action="store_true",
+        help="Expand each query with Mistral-generated related terms before retrieval",
+    )
+    p_eval.add_argument("--limit", type=int, help="Evaluate only the first N queries (for quick/cheap runs)")
     p_eval.set_defaults(func=_cmd_evaluate)
 
     p_search = sub.add_parser("search", help="Run a single ad-hoc query against a built index")
