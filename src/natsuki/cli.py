@@ -241,6 +241,34 @@ def _cmd_search(args: argparse.Namespace) -> None:
         print(f"{rank:>3}  {score:.4f}  {doc_id}")
 
 
+def _cmd_explain(args: argparse.Namespace) -> None:
+    from natsuki.bm25 import BM25
+    from natsuki.data import load_corpus
+    from natsuki.embeddings import embed_query
+    from natsuki.evidence import extract_evidence
+    from natsuki.hybrid import reciprocal_rank_fusion
+    from natsuki.index import DenseIndex, InvertedIndex
+
+    dense = DenseIndex.load(args.dense_index)
+    bm25 = BM25(InvertedIndex.load(args.index)) if args.index else None
+
+    if bm25 is not None:
+        bm25_hits = [doc_id for doc_id, _ in bm25.search(args.query, top_k=100)]
+        dense_hits = [doc_id for doc_id, _ in dense.search(embed_query(args.query), top_k=100)]
+        top_docs = [doc_id for doc_id, _ in reciprocal_rank_fusion([bm25_hits, dense_hits])[: args.k]]
+    else:
+        top_docs = [doc_id for doc_id, _ in dense.search(embed_query(args.query), top_k=args.k)]
+
+    doc_text_by_id = dict(load_corpus(args.dataset))
+
+    for rank, doc_id in enumerate(top_docs, 1):
+        text = doc_text_by_id.get(doc_id, "")
+        evidence = extract_evidence(args.query, text, top_n=args.sentences)
+        print(f"\n{rank}. {doc_id}")
+        for sentence, score in evidence:
+            print(f"   [{score:.3f}] {sentence}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="natsuki")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -310,6 +338,17 @@ def main() -> None:
     p_search.add_argument("--query", required=True)
     p_search.add_argument("--k", type=int, default=10)
     p_search.set_defaults(func=_cmd_search)
+
+    p_explain = sub.add_parser(
+        "explain", help="Retrieve top-k docs for a query and extract the most relevant sentence from each"
+    )
+    p_explain.add_argument("--dataset", required=True)
+    p_explain.add_argument("--dense-index", required=True)
+    p_explain.add_argument("--index", help="BM25 index path; if given, retrieval is hybrid RRF instead of dense-only")
+    p_explain.add_argument("--query", required=True)
+    p_explain.add_argument("--k", type=int, default=3, help="number of documents")
+    p_explain.add_argument("--sentences", type=int, default=1, help="evidence sentences per document")
+    p_explain.set_defaults(func=_cmd_explain)
 
     args = parser.parse_args()
     args.func(args)
