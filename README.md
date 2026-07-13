@@ -28,16 +28,38 @@ benchmarks with real relevance judgments.
 - `src/natsuki/cli.py` — `natsuki build-index`, `build-dense-index`,
   `evaluate --mode {bm25,dense,hybrid}`, `search`.
 
-**Validated on BEIR/SciFact** (5,183 docs, 300 test queries, real qrels):
+**Phase 3 (done):** learned reranker.
+
+- `src/natsuki/features.py` — candidate set = union of BM25's and dense
+  retrieval's top-fanout hits; features = each retriever's score and
+  reciprocal rank (0 if not retrieved by that method) plus an in_both flag.
+- `src/natsuki/reranker.py` — LambdaMART (`lightgbm.LGBMRanker`, CPU),
+  trained on labeled (query, doc) candidates instead of hand-picking a
+  fusion formula.
+- `src/natsuki/cli.py` — `natsuki train-reranker`, `evaluate --mode rerank`.
+
+**Validated on BEIR/SciFact** (5,183 docs, 300 test queries, real qrels;
+reranker trained on the separate 809-query train split, no leakage):
 
 | mode   | ndcg@10 | mrr    | recall@10 | ms/query |
 |--------|---------|--------|-----------|----------|
 | bm25   | 0.6692  | 0.6432 | 0.7856    | 0.74     |
 | dense  | 0.7215  | 0.6932 | 0.8396    | 42.10    |
 | hybrid | 0.7245  | 0.6988 | 0.8379    | 48.19    |
+| rerank | 0.7459  | 0.7144 | 0.8762    | 52.38    |
+
+The reranker beats hybrid RRF on every metric: NDCG@10 0.7459 vs 0.7245,
+MRR 0.7144 vs 0.6988, Recall@10 0.8762 vs 0.8379 — a clean monotonic
+improvement across all four modes (bm25 < dense < hybrid < rerank).
+Trained on 809 queries / 138,103 (query, doc) candidate pairs (906
+positive) in ~40s. Feature importance (gain) came out heavily skewed
+toward `dense_rank_recip` (~103.6k) over everything else (bm25 rank ~6.1k,
+bm25/dense raw scores ~2.2-2.4k, in_both ~0.4k) — consistent with dense
+retrieval's much stronger standalone numbers above; the model learned
+that skew from data rather than it being hand-tuned in.
 
 The published BEIR paper reports a BM25 baseline of **NDCG@10 ≈ 0.665** on
-SciFact — this from-scratch implementation lands at 0.6692, matching the
+SciFact. This from-scratch implementation lands at 0.6692, matching the
 reference almost exactly. That's the correctness check for the whole
 tokenizer -> index -> BM25 pipeline before anything else gets layered on.
 
@@ -48,7 +70,7 @@ combining the two ranking signals helps even when one is individually much
 stronger, at roughly the cost of the slower retriever (dense embedding of
 the query dominates hybrid latency; BM25's own contribution is sub-ms).
 
-Document embedding on this CPU-only laptop ran at **~5.3 docs/sec**
+Document embedding on a CPU-only laptop ran at **~5.3 docs/sec**
 (5,183 docs in ~16 minutes) — a real throughput number for the "why the
 architecture looks like this" hardware-notes section below, and the basis
 for the ~500k-1M document corpus-size target (that throughput puts a
@@ -58,7 +80,6 @@ as a genuine overnight/multi-day batch job rather than an interactive step).
 
 **Not yet built:**
 
-- LambdaMART (LightGBM) learned reranker on top of BM25+dense candidates.
 - Query understanding / LLM-judge eval via Mistral API.
 - Real-time incremental indexing.
 - Permission-aware filtering (deliberately descoped for now).
@@ -100,6 +121,16 @@ uv run natsuki evaluate --dataset beir/scifact/test --mode dense --dense-index i
 uv run natsuki evaluate --dataset beir/scifact/test --mode hybrid \
   --index indexes/scifact.index.gz --dense-index indexes/scifact.dense.npz --k 10
 
+# Train the learned reranker on a dataset's train split
+uv run natsuki train-reranker --train-dataset beir/scifact/train \
+  --index indexes/scifact.index.gz --dense-index indexes/scifact.dense.npz \
+  --out models/reranker.txt
+
+# Evaluate the reranker on the (held-out) test split
+uv run natsuki evaluate --dataset beir/scifact/test --mode rerank \
+  --index indexes/scifact.index.gz --dense-index indexes/scifact.dense.npz \
+  --reranker models/reranker.txt --k 10
+
 # Ad-hoc single BM25 query
 uv run natsuki search --index indexes/scifact.index.gz --query "your query here" --k 10
 ```
@@ -110,14 +141,17 @@ uv run natsuki search --index indexes/scifact.index.gz --query "your query here"
 uv run pytest -q
 ```
 
-22 unit tests covering tokenizer edge cases, BM25 ranking behavior (term
+30 unit tests covering tokenizer edge cases, BM25 ranking behavior (term
 frequency ordering, no-match handling, unfinalized-index guard), dense
-index search/persistence, reciprocal rank fusion, and eval metrics against
-hand-computed NDCG/MRR/Recall values. Dense-index tests use hand-crafted
-vectors rather than the real embedding model, so the suite stays fast and
-offline — embedding correctness itself was checked manually (see
-`natsuki/embeddings.py` docstring) and validated indirectly by the SciFact
-NDCG numbers above matching the published baseline.
+index search/persistence, reciprocal rank fusion, candidate feature
+extraction, the LambdaMART reranker (including a synthetic-data test that
+checks it actually learns to weight a real signal over pure noise), and
+eval metrics against hand-computed NDCG/MRR/Recall values. Dense-index and
+reranker tests use hand-crafted vectors/features rather than the real
+embedding model, so the suite stays fast and offline — embedding
+correctness itself was checked manually (see `natsuki/embeddings.py`
+docstring) and validated indirectly by the SciFact NDCG numbers above
+matching the published baseline.
 
 ## Hardware notes (why the architecture looks like this)
 
