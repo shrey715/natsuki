@@ -32,6 +32,46 @@ reasoning below). SciFact queries are precise scientific claims that
 BM25/dense already handle well, so the injected synonyms mostly add
 noise rather than closing a vocabulary gap.
 
+## Nearest-neighbor search: KD-tree vs LSH
+
+Two more retrieval backends, both built from scratch (no FAISS/hnswlib)
+and benchmarked against the flat brute-force dense index above, on the
+same 5,183-doc corpus:
+
+| index        | ndcg@10 | mrr    | recall@10 | ms/query | candidates touched |
+|--------------|---------|--------|-----------|----------|--------------------|
+| dense (flat) | 0.7215  | 0.6932 | 0.8396    | 42.10    | 100% (5183/5183)   |
+| kdtree       | 0.7215  | 0.6932 | 0.8396    | 51.00    | 100% (5183/5183)   |
+| lsh (8t/8b)  | 0.6355  | 0.6237 | 0.7176    | 55.12    | 44.9% (2327/5183)  |
+| lsh (16t/6b) | 0.7168  | 0.6895 | 0.8339    | 59.45    | 93.1% (4823/5183)  |
+
+**KD-tree** does exact search with branch-and-bound pruning. At 384
+dimensions it visits all 5,183 nodes per query, every time — the tree is
+only ~13 levels deep for this corpus, so almost none of the 384
+dimensions ever get split on, and pruning has nothing to work with. Its
+NDCG/MRR/Recall match flat dense exactly (it's exact search, not
+approximate), but at 51ms/query it's slower than the 42ms flat numpy
+matmul. There's no upside here — that's the point of building it: KD-trees
+work well for low-dimensional spatial data, not high-dimensional
+embeddings, and this measures that directly instead of citing it.
+
+**LSH** (random hyperplane hashing, tunable via table/bit count) does
+show a real reduction in work: with 8 tables and 8 bits per table, each
+query only gets compared against 44.9% of the corpus, at a real recall
+cost. With 16 tables and 6 bits, it recovers most of that quality (NDCG@10
+0.7168 vs flat's 0.7215) while still only touching 93.1% of the corpus —
+a genuine, tunable recall/candidate-fraction tradeoff.
+
+Neither structure actually wins on wall-clock time here, and that's an
+honest result, not a bug: 5,183 docs is small enough that one vectorized
+numpy matmul is already close to the floor, while pure-Python hashing and
+tree traversal both carry their own per-query overhead. The
+candidates-touched number is what would turn into a real wall-clock win
+at a larger corpus size or in a compiled implementation — which is also
+why production systems reach for graph-based structures (HNSW) or
+vectorized libraries (FAISS) once the corpus is big enough for it to
+matter, rather than either of these.
+
 ## Architecture
 
 ```text
@@ -57,6 +97,8 @@ src/natsuki/
   index/
     inverted_index.py     term -> postings (doc_id, tf), BM25's index
     dense_index.py         flat cosine-similarity vector index
+    kdtree_index.py         from-scratch KD-tree ANN
+    lsh_index.py             from-scratch LSH (random hyperplane) ANN
   bm25.py                  BM25 scoring (Robertson/Sparck-Jones IDF)
   embeddings.py            local CPU embeddings (fastembed/ONNX, no GPU)
   hybrid.py                reciprocal rank fusion
@@ -111,6 +153,14 @@ uv run natsuki evaluate --dataset beir/scifact/test --mode rerank \
 uv run natsuki evaluate --dataset beir/scifact/test --mode rerank \
   --index indexes/scifact.index.gz --dense-index indexes/scifact.dense.npz \
   --reranker models/reranker.txt --k 10 --expand-query --limit 100
+
+# Build KD-tree / LSH indexes on top of an existing dense index's vectors
+uv run natsuki build-kdtree-index --dense-index indexes/scifact.dense.npz --out indexes/scifact.kdtree.pkl.gz
+uv run natsuki build-lsh-index --dense-index indexes/scifact.dense.npz --out indexes/scifact.lsh.pkl.gz \
+  --num-tables 16 --num-bits 6
+
+uv run natsuki evaluate --dataset beir/scifact/test --mode kdtree --kdtree-index indexes/scifact.kdtree.pkl.gz --k 10
+uv run natsuki evaluate --dataset beir/scifact/test --mode lsh --lsh-index indexes/scifact.lsh.pkl.gz --k 10
 
 # Ad-hoc single BM25 query
 uv run natsuki search --index indexes/scifact.index.gz --query "your query here" --k 10
@@ -168,14 +218,17 @@ between how users phrase queries and how documents are written.
 uv run pytest -q
 ```
 
-35 tests covering tokenizer edge cases, BM25 ranking behavior (term
+47 tests covering tokenizer edge cases, BM25 ranking behavior (term
 frequency ordering, no-match handling, unfinalized-index guard), dense
 index search/persistence, reciprocal rank fusion, candidate feature
 extraction, the LambdaMART reranker (including a synthetic-data test that
 checks it learns to weight a real signal over pure noise), query
 expansion (via an injected fake chat function, including the
-fail-open-to-original-query path), and the eval metrics themselves
-against hand-computed NDCG/MRR/Recall values. Dense-index, reranker, and
-query-expansion tests use hand-crafted vectors/features or fake LLM
-responses instead of the real embedding/chat models, so the suite stays
-fast and doesn't need network access or an API key.
+fail-open-to-original-query path), the KD-tree (including a
+high-dimensional test asserting it visits >80% of nodes, matching the
+result above) and LSH (recall-vs-brute-force and candidate-set-size
+tests) indexes, and the eval metrics themselves against hand-computed
+NDCG/MRR/Recall values. Index and query-expansion tests use hand-crafted
+vectors/features or fake LLM responses instead of the real embedding/chat
+models, so the suite stays fast and doesn't need network access or an
+API key.
