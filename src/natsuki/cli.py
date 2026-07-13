@@ -45,6 +45,39 @@ def _cmd_build_dense_index(args: argparse.Namespace) -> None:
     )
 
 
+def _cmd_build_kdtree_index(args: argparse.Namespace) -> None:
+    from natsuki.index import DenseIndex, KDTreeIndex
+
+    dense = DenseIndex.load(args.dense_index)
+    t0 = time.time()
+    index = KDTreeIndex.build(dense)
+    elapsed = time.time() - t0
+
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    index.save(str(out_path))
+
+    print(f"Built KD-tree over {index.size} docs (dim={index.dim}) in {elapsed:.2f}s -> {out_path}")
+
+
+def _cmd_build_lsh_index(args: argparse.Namespace) -> None:
+    from natsuki.index import DenseIndex, LSHIndex
+
+    dense = DenseIndex.load(args.dense_index)
+    t0 = time.time()
+    index = LSHIndex.build(dense, num_tables=args.num_tables, num_bits=args.num_bits)
+    elapsed = time.time() - t0
+
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    index.save(str(out_path))
+
+    print(
+        f"Built LSH index over {len(index.doc_ids)} docs "
+        f"(tables={args.num_tables}, bits={args.num_bits}) in {elapsed:.2f}s -> {out_path}"
+    )
+
+
 def _cmd_train_reranker(args: argparse.Namespace) -> None:
     import numpy as np
     from tqdm import tqdm
@@ -101,7 +134,7 @@ def _cmd_evaluate(args: argparse.Namespace) -> None:
     from natsuki.data import load_qrels, load_queries
     from natsuki.eval import evaluate
     from natsuki.hybrid import reciprocal_rank_fusion
-    from natsuki.index import DenseIndex, InvertedIndex
+    from natsuki.index import DenseIndex, InvertedIndex, KDTreeIndex, LSHIndex
 
     queries = load_queries(args.dataset)
     qrels = load_qrels(args.dataset)
@@ -111,6 +144,8 @@ def _cmd_evaluate(args: argparse.Namespace) -> None:
     bm25 = None
     dense = None
     reranker = None
+    kdtree = None
+    lsh = None
     if args.mode in ("bm25", "hybrid", "rerank"):
         if not args.index:
             raise SystemExit("--index is required for mode=bm25/hybrid/rerank")
@@ -125,9 +160,18 @@ def _cmd_evaluate(args: argparse.Namespace) -> None:
         from natsuki.reranker import LambdaMARTReranker
 
         reranker = LambdaMARTReranker.load(args.reranker)
+    if args.mode == "kdtree":
+        if not args.kdtree_index:
+            raise SystemExit("--kdtree-index is required for mode=kdtree")
+        kdtree = KDTreeIndex.load(args.kdtree_index)
+    if args.mode == "lsh":
+        if not args.lsh_index:
+            raise SystemExit("--lsh-index is required for mode=lsh")
+        lsh = LSHIndex.load(args.lsh_index)
 
     fanout = max(args.k, 100)
     results: dict[str, list[str]] = {}
+    stats_total = 0
     t0 = time.time()
     for qid, qtext in tqdm(queries.items(), desc="querying", unit="query"):
         if args.expand_query:
@@ -150,18 +194,36 @@ def _cmd_evaluate(args: argparse.Namespace) -> None:
             dense_hits = [doc_id for doc_id, _ in dense.search(embed_query(qtext), top_k=fanout)]
             fused = reciprocal_rank_fusion([bm25_hits, dense_hits])
             results[qid] = [doc_id for doc_id, _ in fused]
-        else:  # rerank
+        elif args.mode == "rerank":
             from natsuki.features import candidate_features
 
             features = candidate_features(qtext, bm25, dense, fanout=fanout)
             ranked = reranker.rank(features)
             results[qid] = [doc_id for doc_id, _ in ranked]
+        elif args.mode == "kdtree":
+            from natsuki.embeddings import embed_query
+
+            hits, visited = kdtree.search_with_stats(embed_query(qtext), top_k=fanout)
+            results[qid] = [doc_id for doc_id, _ in hits]
+            stats_total += visited
+        else:  # lsh
+            from natsuki.embeddings import embed_query
+
+            hits, num_candidates = lsh.search_with_stats(embed_query(qtext), top_k=fanout)
+            results[qid] = [doc_id for doc_id, _ in hits]
+            stats_total += num_candidates
     elapsed = time.time() - t0
 
     metrics = evaluate(qrels, results, k=args.k)
     avg_latency_ms = 1000 * elapsed / len(queries)
 
     print(f"\nmode={args.mode}  {len(queries)} queries, {avg_latency_ms:.2f} ms/query avg")
+    if args.mode == "kdtree":
+        corpus_size = kdtree.size
+        print(f"avg nodes visited: {stats_total / len(queries):.0f} / {corpus_size} ({100 * stats_total / len(queries) / corpus_size:.1f}%)")
+    elif args.mode == "lsh":
+        corpus_size = len(lsh.doc_ids)
+        print(f"avg candidates examined: {stats_total / len(queries):.0f} / {corpus_size} ({100 * stats_total / len(queries) / corpus_size:.1f}%)")
     for name, val in metrics.items():
         if name == "num_queries":
             continue
@@ -196,6 +258,22 @@ def main() -> None:
     p_dense.add_argument("--batch-size", type=int, default=64)
     p_dense.set_defaults(func=_cmd_build_dense_index)
 
+    p_kdtree = sub.add_parser(
+        "build-kdtree-index", help="Build a from-scratch KD-tree over an existing dense index's vectors"
+    )
+    p_kdtree.add_argument("--dense-index", required=True, help="Dense index path (source of vectors)")
+    p_kdtree.add_argument("--out", required=True, help="output path, e.g. indexes/scifact.kdtree.pkl.gz")
+    p_kdtree.set_defaults(func=_cmd_build_kdtree_index)
+
+    p_lsh = sub.add_parser(
+        "build-lsh-index", help="Build a from-scratch LSH index over an existing dense index's vectors"
+    )
+    p_lsh.add_argument("--dense-index", required=True, help="Dense index path (source of vectors)")
+    p_lsh.add_argument("--out", required=True, help="output path, e.g. indexes/scifact.lsh.pkl.gz")
+    p_lsh.add_argument("--num-tables", type=int, default=8)
+    p_lsh.add_argument("--num-bits", type=int, default=10)
+    p_lsh.set_defaults(func=_cmd_build_lsh_index)
+
     p_train = sub.add_parser(
         "train-reranker", help="Train a LambdaMART reranker on labeled (query, doc) candidates"
     )
@@ -208,12 +286,16 @@ def main() -> None:
 
     p_eval = sub.add_parser("evaluate", help="Evaluate retrieval against a dataset's qrels")
     p_eval.add_argument("--dataset", required=True)
-    p_eval.add_argument("--mode", choices=["bm25", "dense", "hybrid", "rerank"], default="bm25")
+    p_eval.add_argument(
+        "--mode", choices=["bm25", "dense", "hybrid", "rerank", "kdtree", "lsh"], default="bm25"
+    )
     p_eval.add_argument("--index", help="BM25 index path (required for mode=bm25/hybrid/rerank)")
     p_eval.add_argument(
         "--dense-index", help="Dense index path (required for mode=dense/hybrid/rerank)"
     )
     p_eval.add_argument("--reranker", help="Trained reranker model path (required for mode=rerank)")
+    p_eval.add_argument("--kdtree-index", help="KD-tree index path (required for mode=kdtree)")
+    p_eval.add_argument("--lsh-index", help="LSH index path (required for mode=lsh)")
     p_eval.add_argument("--k", type=int, default=10)
     p_eval.add_argument(
         "--expand-query",
