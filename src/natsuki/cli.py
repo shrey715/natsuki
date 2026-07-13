@@ -45,6 +45,55 @@ def _cmd_build_dense_index(args: argparse.Namespace) -> None:
     )
 
 
+def _cmd_train_reranker(args: argparse.Namespace) -> None:
+    import numpy as np
+    from tqdm import tqdm
+
+    from natsuki.bm25 import BM25
+    from natsuki.data import load_qrels, load_queries
+    from natsuki.features import candidate_features
+    from natsuki.index import DenseIndex, InvertedIndex
+    from natsuki.reranker import LambdaMARTReranker
+
+    bm25 = BM25(InvertedIndex.load(args.index))
+    dense = DenseIndex.load(args.dense_index)
+    queries = load_queries(args.train_dataset)
+    qrels = load_qrels(args.train_dataset)
+
+    X_rows: list[np.ndarray] = []
+    y_rows: list[int] = []
+    group: list[int] = []
+    t0 = time.time()
+    for qid, qtext in tqdm(queries.items(), desc="building training candidates", unit="query"):
+        relevant = qrels.get(qid, {})
+        features = candidate_features(qtext, bm25, dense, fanout=args.fanout)
+        if not features:
+            continue
+        doc_ids = list(features.keys())
+        X_rows.extend(features[d] for d in doc_ids)
+        y_rows.extend(1 if relevant.get(d, 0) > 0 else 0 for d in doc_ids)
+        group.append(len(doc_ids))
+    elapsed = time.time() - t0
+
+    X = np.stack(X_rows)
+    y = np.array(y_rows)
+
+    reranker = LambdaMARTReranker()
+    reranker.fit(X, y, group)
+
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    reranker.save(str(out_path))
+
+    print(
+        f"Trained on {len(group)} queries, {len(y)} (query,doc) pairs "
+        f"({int(y.sum())} positive) in {elapsed:.1f}s -> {out_path}"
+    )
+    print("Feature importance (gain):")
+    for name, val in sorted(reranker.feature_importance().items(), key=lambda kv: -kv[1]):
+        print(f"  {name}: {val:.1f}")
+
+
 def _cmd_evaluate(args: argparse.Namespace) -> None:
     from tqdm import tqdm
 
@@ -59,14 +108,21 @@ def _cmd_evaluate(args: argparse.Namespace) -> None:
 
     bm25 = None
     dense = None
-    if args.mode in ("bm25", "hybrid"):
+    reranker = None
+    if args.mode in ("bm25", "hybrid", "rerank"):
         if not args.index:
-            raise SystemExit("--index is required for mode=bm25/hybrid")
+            raise SystemExit("--index is required for mode=bm25/hybrid/rerank")
         bm25 = BM25(InvertedIndex.load(args.index))
-    if args.mode in ("dense", "hybrid"):
+    if args.mode in ("dense", "hybrid", "rerank"):
         if not args.dense_index:
-            raise SystemExit("--dense-index is required for mode=dense/hybrid")
+            raise SystemExit("--dense-index is required for mode=dense/hybrid/rerank")
         dense = DenseIndex.load(args.dense_index)
+    if args.mode == "rerank":
+        if not args.reranker:
+            raise SystemExit("--reranker is required for mode=rerank")
+        from natsuki.reranker import LambdaMARTReranker
+
+        reranker = LambdaMARTReranker.load(args.reranker)
 
     fanout = max(args.k, 100)
     results: dict[str, list[str]] = {}
@@ -80,13 +136,19 @@ def _cmd_evaluate(args: argparse.Namespace) -> None:
 
             hits = dense.search(embed_query(qtext), top_k=fanout)
             results[qid] = [doc_id for doc_id, _ in hits]
-        else:  # hybrid
+        elif args.mode == "hybrid":
             from natsuki.embeddings import embed_query
 
             bm25_hits = [doc_id for doc_id, _ in bm25.search(qtext, top_k=fanout)]
             dense_hits = [doc_id for doc_id, _ in dense.search(embed_query(qtext), top_k=fanout)]
             fused = reciprocal_rank_fusion([bm25_hits, dense_hits])
             results[qid] = [doc_id for doc_id, _ in fused]
+        else:  # rerank
+            from natsuki.features import candidate_features
+
+            features = candidate_features(qtext, bm25, dense, fanout=fanout)
+            ranked = reranker.rank(features)
+            results[qid] = [doc_id for doc_id, _ in ranked]
     elapsed = time.time() - t0
 
     metrics = evaluate(qrels, results, k=args.k)
@@ -127,11 +189,24 @@ def main() -> None:
     p_dense.add_argument("--batch-size", type=int, default=64)
     p_dense.set_defaults(func=_cmd_build_dense_index)
 
+    p_train = sub.add_parser(
+        "train-reranker", help="Train a LambdaMART reranker on labeled (query, doc) candidates"
+    )
+    p_train.add_argument("--train-dataset", required=True, help="e.g. beir/scifact/train")
+    p_train.add_argument("--index", required=True, help="BM25 index path")
+    p_train.add_argument("--dense-index", required=True, help="Dense index path")
+    p_train.add_argument("--out", required=True, help="output path, e.g. models/reranker.txt")
+    p_train.add_argument("--fanout", type=int, default=100)
+    p_train.set_defaults(func=_cmd_train_reranker)
+
     p_eval = sub.add_parser("evaluate", help="Evaluate retrieval against a dataset's qrels")
     p_eval.add_argument("--dataset", required=True)
-    p_eval.add_argument("--mode", choices=["bm25", "dense", "hybrid"], default="bm25")
-    p_eval.add_argument("--index", help="BM25 index path (required for mode=bm25/hybrid)")
-    p_eval.add_argument("--dense-index", help="Dense index path (required for mode=dense/hybrid)")
+    p_eval.add_argument("--mode", choices=["bm25", "dense", "hybrid", "rerank"], default="bm25")
+    p_eval.add_argument("--index", help="BM25 index path (required for mode=bm25/hybrid/rerank)")
+    p_eval.add_argument(
+        "--dense-index", help="Dense index path (required for mode=dense/hybrid/rerank)"
+    )
+    p_eval.add_argument("--reranker", help="Trained reranker model path (required for mode=rerank)")
     p_eval.add_argument("--k", type=int, default=10)
     p_eval.set_defaults(func=_cmd_evaluate)
 
